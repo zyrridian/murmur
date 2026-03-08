@@ -1,0 +1,4 @@
+/target/
+chat_history.txt
+*_history.txt
+**/*.rs.bk

@@ -1,0 +1,21 @@
+[package]
+name = "cli"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+# Pull these from the workspace root so versions always match across your whole project
+tokio = { workspace = true }
+libp2p = { workspace = true, features = ["macros", "tcp", "tokio", "noise", "yamux", "gossipsub", "mdns"] }
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+# Keep these local to the CLI, since your web app/mobile app won't use terminal UIs
+crossterm = { version = "0.29.0", features = ["event-stream"] }
+futures = "0.3.32"
+ratatui = "0.30.0"
+chrono = "0.4.44"
+
+# Link to your internal crates (even though they are empty right now)
+chat-protocol = { path = "../../crates/chat-protocol" }
+chat-core = { path = "../../crates/chat-core" }
