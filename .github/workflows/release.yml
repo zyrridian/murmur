@@ -1,0 +1,51 @@
+name: Build and Release
+
+on:
+  push:
+    branches:
+      - dev
+    tags:
+      - "v*"
+
+jobs:
+  build:
+    name: Build on ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        include:
+          - os: ubuntu-latest
+            artifact_name: murmur
+            asset_name: murmur-linux-amd64
+          - os: windows-latest
+            artifact_name: cli.exe
+            asset_name: murmur-windows-amd64.exe
+          - os: macos-latest
+            artifact_name: murmur
+            asset_name: murmur-macos-amd64
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Build Release Binary
+        run: cargo build --release --bin cli
+
+      - name: Rename Artifact (Linux/macOS)
+        if: matrix.os != 'windows-latest'
+        run: mv target/release/cli target/release/${{ matrix.asset_name }}
+
+      - name: Rename Artifact (Windows)
+        if: matrix.os == 'windows-latest'
+        run: move target\release\cli.exe target\release\${{ matrix.asset_name }}
+
+      - name: Upload Release Asset
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v1
+        with:
+          files: target/release/${{ matrix.asset_name }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
