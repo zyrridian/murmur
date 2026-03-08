@@ -1,0 +1,8 @@
+[package]
+name = "chat-core"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+libp2p = { workspace = true, features = ["macros", "tcp", "tokio", "noise", "yamux", "gossipsub", "mdns"] }
+tokio = { workspace = true }
