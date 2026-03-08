@@ -7,21 +7,25 @@ on:
     tags:
       - "v*"
 
+permissions:
+  contents: write
+
 jobs:
   build:
     name: Build on ${{ matrix.os }}
     runs-on: ${{ matrix.os }}
     strategy:
+      fail-fast: false
       matrix:
         include:
           - os: ubuntu-latest
-            artifact_name: murmur
+            binary_name: cli
             asset_name: murmur-linux-amd64
           - os: windows-latest
-            artifact_name: cli.exe
+            binary_name: cli.exe
             asset_name: murmur-windows-amd64.exe
           - os: macos-latest
-            artifact_name: murmur
+            binary_name: cli
             asset_name: murmur-macos-amd64
 
     steps:
@@ -31,21 +35,42 @@ jobs:
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
 
-      - name: Build Release Binary
+      - name: Build release binary
         run: cargo build --release --bin cli
 
-      - name: Rename Artifact (Linux/macOS)
+      - name: Prepare artifact (Linux/macOS)
         if: matrix.os != 'windows-latest'
-        run: mv target/release/cli target/release/${{ matrix.asset_name }}
+        run: cp target/release/${{ matrix.binary_name }} ${{ matrix.asset_name }}
 
-      - name: Rename Artifact (Windows)
+      - name: Prepare artifact (Windows)
         if: matrix.os == 'windows-latest'
-        run: move target\release\cli.exe target\release\${{ matrix.asset_name }}
+        run: copy target\release\${{ matrix.binary_name }} ${{ matrix.asset_name }}
 
-      - name: Upload Release Asset
-        if: startsWith(github.ref, 'refs/tags/')
-        uses: softprops/action-gh-release@v1
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
         with:
-          files: target/release/${{ matrix.asset_name }}
+          name: ${{ matrix.asset_name }}
+          path: ${{ matrix.asset_name }}
+
+  release:
+    name: Publish GitHub Release
+    if: startsWith(github.ref, 'refs/tags/')
+    needs: build
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Download all build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+
+      - name: List files (debug)
+        run: find dist -type f -maxdepth 3
+
+      - name: Create release and upload assets
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/**/*
+          generate_release_notes: true
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
