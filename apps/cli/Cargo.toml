@@ -19,3 +19,4 @@ chrono = "0.4.44"
 # Link to your internal crates (even though they are empty right now)
 chat-protocol = { path = "../../crates/chat-protocol" }
 chat-core = { path = "../../crates/chat-core" }
+sqlx = { workspace = true, features = ["sqlite", "runtime-tokio", "chrono"] }

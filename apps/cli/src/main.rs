@@ -14,9 +14,10 @@ use ratatui::{
     widgets::{Block, Borders, List, ListItem, ListState, Paragraph},
 };
 use std::{collections::HashMap, error::Error};
-use tokio::fs::{File, OpenOptions};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::mpsc;
+
+use sqlx::{Row, sqlite::SqlitePoolOptions};
+// use std::str::FromStr;
 
 enum NetworkCommand {
     Publish(String),
@@ -37,7 +38,25 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let username = std::env::args()
         .nth(1)
         .unwrap_or_else(|| "Anonymous".to_string());
-    let history_filename = format!("{}_history.txt", username);
+
+    let db_url = format!("sqlite://{}_murmur.db?mode=rwc", username);
+    let pool = SqlitePoolOptions::new()
+        .max_connections(5)
+        .connect(&db_url)
+        .await
+        .expect("Failed to connect to SQLite database");
+
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS messages (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            timestamp TEXT NOT NULL,
+            sender TEXT NOT NULL,
+            content TEXT NOT NULL
+        );",
+    )
+    .execute(&pool)
+    .await
+    .expect("Failed to create database schema");
 
     let mut swarm = setup_swarm(local_key, local_peer_id)?;
     swarm.listen_on("/ip4/0.0.0.0/tcp/0".parse()?)?;
@@ -146,22 +165,27 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let mut list_state = ListState::default();
     let mut connected_peers: HashMap<String, String> = HashMap::new();
 
-    if let Ok(mut file) = File::open(&history_filename).await {
-        let mut contents = String::new();
-        if file.read_to_string(&mut contents).await.is_ok() {
-            messages.extend(contents.lines().map(String::from));
-        }
+    let rows = sqlx::query("SELECT timestamp, sender, content FROM messages ORDER BY id ASC")
+        .fetch_all(&pool)
+        .await
+        .unwrap_or_default();
+
+    for row in rows {
+        let ts: String = row.get("timestamp");
+        let snd: String = row.get("sender");
+        let msg: String = row.get("content");
+        messages.push(format!("[{ts}] {snd}: {msg}"));
     }
 
     messages.push("Starting decentralized chat node...".to_string());
     messages.push(format!("My unique Peer ID is: {local_peer_id}"));
     messages.push(format!("Logged in as: {username}"));
 
-    let mut history_file = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&history_filename)
-        .await?;
+    // let mut history_file = OpenOptions::new()
+    //     .create(true)
+    //     .append(true)
+    //     .open(&history_filename)
+    //     .await?;
 
     enable_raw_mode()?;
     std::io::stdout().execute(EnterAlternateScreen)?;
@@ -229,7 +253,17 @@ async fn main() -> Result<(), Box<dyn Error>> {
                                     Err(_) => messages.push("Invalid Peer ID format.".to_string()),
                                 }
                             } else {
-                                let _ = cmd_tx.send(NetworkCommand::Publish(line)).await;
+                                let _ = cmd_tx.send(NetworkCommand::Publish(line.clone())).await;
+                                let now = Local::now().format("%H:%M:%S").to_string();
+                                let display_msg = format!("[{now}] {username}: {line}");
+                                messages.push(display_msg);
+
+                                let _ = sqlx::query("INSERT INTO messages (timestamp, sender, content) VALUES (?, ?, ?)")
+                                    .bind(&now)
+                                    .bind(&username)
+                                    .bind(&line)
+                                    .execute(&pool)
+                                    .await;
                             }
                         }
                         KeyCode::Char(c) => input.push(c),
@@ -246,8 +280,14 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 NetworkEvent::MessageReceived(sender, content) => {
                     let now = Local::now().format("%H:%M:%S").to_string();
                     let display_msg = format!("[{now}] {sender}: {content}");
-                    messages.push(display_msg.clone());
-                    let _ = history_file.write_all(format!("{display_msg}\n").as_bytes()).await;
+                    messages.push(display_msg);
+
+                    let _ = sqlx::query("INSERT INTO messages (timestamp, sender, content) VALUES (?, ?, ?)")
+                        .bind(&now)
+                        .bind(&sender)
+                        .bind(&content)
+                        .execute(&pool)
+                        .await;
                 }
                 NetworkEvent::PeerConnected(peer_id, name) => {
                     connected_peers.insert(peer_id, name);
