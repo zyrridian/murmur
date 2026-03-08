@@ -6,7 +6,7 @@ edition = "2024"
 [dependencies]
 # Pull these from the workspace root so versions always match across your whole project
 tokio = { workspace = true }
-libp2p = { workspace = true, features = ["macros", "tcp", "tokio", "noise", "yamux", "gossipsub", "mdns"] }
+libp2p = { workspace = true, features = ["macros", "tcp", "tokio", "noise", "yamux", "gossipsub", "mdns", "kad"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
 

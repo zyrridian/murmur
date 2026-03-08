@@ -1,5 +1,5 @@
 use libp2p::{
-    gossipsub, identity, mdns, swarm::NetworkBehaviour, PeerId, Swarm, SwarmBuilder,
+    PeerId, Swarm, SwarmBuilder, gossipsub, identity, kad, mdns, swarm::NetworkBehaviour,
 };
 use std::{
     collections::hash_map::DefaultHasher,
@@ -10,8 +10,10 @@ use std::{
 
 #[derive(NetworkBehaviour)]
 pub struct ChatBehaviour {
-    pub gossipsub: gossipsub::Behaviour<gossipsub::IdentityTransform, gossipsub::AllowAllSubscriptionFilter>,
+    pub gossipsub:
+        gossipsub::Behaviour<gossipsub::IdentityTransform, gossipsub::AllowAllSubscriptionFilter>,
     pub mdns: mdns::tokio::Behaviour,
+    pub kademlia: kad::Behaviour<kad::store::MemoryStore>,
 }
 
 pub fn generate_identity() -> (identity::Keypair, PeerId) {
@@ -52,7 +54,16 @@ pub fn setup_swarm(
     gossipsub.subscribe(&topic)?;
 
     let mdns = mdns::tokio::Behaviour::new(mdns::Config::default(), local_peer_id)?;
-    let behaviour = ChatBehaviour { gossipsub, mdns };
+
+    // Create the Kademlia in-memory store and behaviour
+    let store = kad::store::MemoryStore::new(local_peer_id);
+    let kademlia = kad::Behaviour::new(local_peer_id, store);
+
+    let behaviour = ChatBehaviour {
+        gossipsub,
+        mdns,
+        kademlia,
+    };
 
     let swarm = SwarmBuilder::with_existing_identity(local_key)
         .with_tokio()
@@ -62,9 +73,7 @@ pub fn setup_swarm(
             libp2p::yamux::Config::default,
         )?
         .with_behaviour(|_| behaviour)?
-        .with_swarm_config(|cfg| {
-            cfg.with_idle_connection_timeout(Duration::from_secs(60))
-        })
+        .with_swarm_config(|cfg| cfg.with_idle_connection_timeout(Duration::from_secs(60)))
         .build();
 
     Ok(swarm)

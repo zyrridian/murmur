@@ -1,33 +1,145 @@
-use chat_core::{generate_identity, global_topic, setup_swarm, ChatBehaviourEvent};
+use chat_core::{ChatBehaviourEvent, generate_identity, global_topic, setup_swarm};
 use chat_protocol::ChatMessage;
 use chrono::Local;
 use crossterm::{
-    event::{EventStream, KeyCode, KeyEventKind, KeyModifiers},
-    terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
     ExecutableCommand,
+    event::{EventStream, KeyCode, KeyEventKind, KeyModifiers},
+    terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
 use futures::StreamExt;
-use libp2p::{gossipsub, mdns, swarm::SwarmEvent};
+use libp2p::{PeerId, gossipsub, kad, mdns, swarm::SwarmEvent};
 use ratatui::{
+    Terminal,
     prelude::*,
     widgets::{Block, Borders, List, ListItem, ListState, Paragraph},
-    Terminal,
 };
 use std::{collections::HashMap, error::Error};
 use tokio::fs::{File, OpenOptions};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::sync::mpsc;
+
+enum NetworkCommand {
+    Publish(String),
+    Dial(String),
+    FindPeer(PeerId),
+}
+
+enum NetworkEvent {
+    Log(String),
+    PeerConnected(String, String),
+    PeerDisconnected(String),
+    MessageReceived(String, String),
+}
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
     let (local_key, local_peer_id) = generate_identity();
-    let username = std::env::args().nth(1).unwrap_or_else(|| "Anonymous".to_string());
+    let username = std::env::args()
+        .nth(1)
+        .unwrap_or_else(|| "Anonymous".to_string());
     let history_filename = format!("{}_history.txt", username);
 
     let mut swarm = setup_swarm(local_key, local_peer_id)?;
     swarm.listen_on("/ip4/0.0.0.0/tcp/0".parse()?)?;
-
     let topic = global_topic();
 
+    let (cmd_tx, mut cmd_rx) = mpsc::channel::<NetworkCommand>(100);
+    let (event_tx, mut event_rx) = mpsc::channel::<NetworkEvent>(100);
+
+    let username_net = username.clone();
+
+    // --- TASK 1: THE NETWORK ENGINE ---
+    tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                Some(cmd) = cmd_rx.recv() => match cmd {
+                    NetworkCommand::Publish(line) => {
+                        let msg = ChatMessage { sender: username_net.clone(), content: line.clone() };
+                        if let Ok(bytes) = serde_json::to_vec(&msg) {
+                            if let Err(e) = swarm.behaviour_mut().gossipsub.publish(topic.clone(), bytes) {
+                                let _ = event_tx.send(NetworkEvent::Log(format!("Publish error: {e:?}"))).await;
+                            } else {
+                                let _ = event_tx.send(NetworkEvent::MessageReceived(username_net.clone(), line)).await;
+                            }
+                        }
+                    }
+                    NetworkCommand::Dial(addr) => {
+                        if let Ok(multiaddr) = addr.parse::<libp2p::Multiaddr>() {
+                            if let Err(e) = swarm.dial(multiaddr) {
+                                let _ = event_tx.send(NetworkEvent::Log(format!("Dial error: {e:?}"))).await;
+                            } else {
+                                let _ = event_tx.send(NetworkEvent::Log(format!("Dialing {addr}..."))).await;
+                            }
+                        }
+                    }
+                    NetworkCommand::FindPeer(peer_id) => {
+                        let _ = event_tx.send(NetworkEvent::Log(format!("Searching DHT for {}...", peer_id))).await;
+                        swarm.behaviour_mut().kademlia.get_closest_peers(peer_id);
+                    }
+                },
+                event = swarm.select_next_some() => match event {
+                    SwarmEvent::NewListenAddr { address, .. } => {
+                        let _ = event_tx.send(NetworkEvent::Log(format!("Listening on {address}"))).await;
+                    }
+                    SwarmEvent::Behaviour(ChatBehaviourEvent::Mdns(mdns::Event::Discovered(list))) => {
+                        for (peer, addr) in list {
+                            swarm.behaviour_mut().gossipsub.add_explicit_peer(&peer);
+                            swarm.behaviour_mut().kademlia.add_address(&peer, addr);
+                            let _ = event_tx.send(NetworkEvent::PeerConnected(peer.to_string(), format!("Unknown ({})", &peer.to_string()[..8]))).await;
+                        }
+                    }
+                    SwarmEvent::Behaviour(ChatBehaviourEvent::Mdns(mdns::Event::Expired(list))) => {
+                        for (peer, _) in list {
+                            swarm.behaviour_mut().gossipsub.remove_explicit_peer(&peer);
+                            let _ = event_tx.send(NetworkEvent::PeerDisconnected(peer.to_string())).await;
+                        }
+                    }
+                    SwarmEvent::ConnectionEstablished { peer_id, endpoint, .. } => {
+                        swarm.behaviour_mut().gossipsub.add_explicit_peer(&peer_id);
+                        if endpoint.is_dialer() {
+                            swarm.behaviour_mut().kademlia.add_address(&peer_id, endpoint.get_remote_address().clone());
+                        }
+                        let _ = event_tx.send(NetworkEvent::PeerConnected(peer_id.to_string(), format!("Unknown ({})", &peer_id.to_string()[..8]))).await;
+                    }
+                    SwarmEvent::ConnectionClosed { peer_id, .. } => {
+                        swarm.behaviour_mut().gossipsub.remove_explicit_peer(&peer_id);
+                        let _ = event_tx.send(NetworkEvent::PeerDisconnected(peer_id.to_string())).await;
+                    }
+                    SwarmEvent::Behaviour(ChatBehaviourEvent::Gossipsub(gossipsub::Event::Message { propagation_source, message, .. })) => {
+                        if let Ok(chat_msg) = serde_json::from_slice::<ChatMessage>(&message.data) {
+                            let _ = event_tx.send(NetworkEvent::MessageReceived(chat_msg.sender.clone(), chat_msg.content)).await;
+                            let _ = event_tx.send(NetworkEvent::PeerConnected(propagation_source.to_string(), chat_msg.sender)).await;
+                        }
+                    }
+                    SwarmEvent::Behaviour(ChatBehaviourEvent::Kademlia(kad::Event::OutboundQueryProgressed {
+                        result: kad::QueryResult::GetClosestPeers(Ok(ok)),
+                        ..
+                    })) => {
+                        for peer_info in ok.peers {
+                            let _ = event_tx
+                                .send(NetworkEvent::Log(format!(
+                                    "DHT found peer nearby: {}",
+                                    peer_info.peer_id
+                                )))
+                                .await;
+
+                            for addr in peer_info.addrs {
+                                swarm
+                                    .behaviour_mut()
+                                    .kademlia
+                                    .add_address(&peer_info.peer_id, addr.clone());
+                                let _ = swarm.dial(addr);
+                            }
+                        }
+                    }
+
+                    _ => {}
+                }
+            }
+        }
+    });
+
+    // --- TASK 2: THE UI ENGINE ---
     let mut messages: Vec<String> = Vec::new();
     let mut input = String::new();
     let mut crossterm_events = EventStream::new();
@@ -37,15 +149,13 @@ async fn main() -> Result<(), Box<dyn Error>> {
     if let Ok(mut file) = File::open(&history_filename).await {
         let mut contents = String::new();
         if file.read_to_string(&mut contents).await.is_ok() {
-            for line in contents.lines() {
-                messages.push(line.to_string());
-            }
+            messages.extend(contents.lines().map(String::from));
         }
     }
 
-    messages.push(format!("Starting decentralized chat node..."));
-    messages.push(format!("My unique Peer ID is: {}", local_peer_id));
-    messages.push(format!("Logged in as: {}", username));
+    messages.push("Starting decentralized chat node...".to_string());
+    messages.push(format!("My unique Peer ID is: {local_peer_id}"));
+    messages.push(format!("Logged in as: {username}"));
 
     let mut history_file = OpenOptions::new()
         .create(true)
@@ -61,16 +171,18 @@ async fn main() -> Result<(), Box<dyn Error>> {
         terminal.draw(|f| {
             let main_chunks = Layout::default()
                 .direction(Direction::Horizontal)
-                .constraints([Constraint::Percentage(75), Constraint::Percentage(25)].as_ref())
+                .constraints([Constraint::Percentage(75), Constraint::Percentage(25)])
                 .split(f.area());
 
             let chat_chunks = Layout::default()
                 .direction(Direction::Vertical)
-                .constraints([Constraint::Min(1), Constraint::Length(3)].as_ref())
+                .constraints([Constraint::Min(1), Constraint::Length(3)])
                 .split(main_chunks[0]);
 
-            let messages_list: Vec<ListItem> = messages.iter().map(|m| ListItem::new(m.as_str())).collect();
-            let messages_widget = List::new(messages_list).block(Block::default().borders(Borders::ALL).title("Chat History"));
+            let messages_list: Vec<ListItem> =
+                messages.iter().map(|m| ListItem::new(m.as_str())).collect();
+            let messages_widget = List::new(messages_list)
+                .block(Block::default().borders(Borders::ALL).title("Chat History"));
 
             if !messages.is_empty() {
                 list_state.select(Some(messages.len() - 1));
@@ -78,15 +190,21 @@ async fn main() -> Result<(), Box<dyn Error>> {
             f.render_stateful_widget(messages_widget, chat_chunks[0], &mut list_state);
 
             let input_widget = Paragraph::new(input.as_str()).block(
-                Block::default().borders(Borders::ALL).title("Type a message (Press Esc or Ctrl+C to quit)"),
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title("Type a message (Press Esc or Ctrl+C to quit)"),
             );
             f.render_widget(input_widget, chat_chunks[1]);
 
             let mut active_peers: Vec<String> = connected_peers.values().cloned().collect();
             active_peers.sort();
 
-            let peers_list: Vec<ListItem> = active_peers.iter().map(|p| ListItem::new(p.as_str())).collect();
-            let peers_widget = List::new(peers_list).block(Block::default().borders(Borders::ALL).title("Online Peers"));
+            let peers_list: Vec<ListItem> = active_peers
+                .iter()
+                .map(|p| ListItem::new(p.as_str()))
+                .collect();
+            let peers_widget = List::new(peers_list)
+                .block(Block::default().borders(Borders::ALL).title("Online Peers"));
             f.render_widget(peers_widget, main_chunks[1]);
         })?;
 
@@ -96,36 +214,22 @@ async fn main() -> Result<(), Box<dyn Error>> {
                     match key.code {
                         KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => break,
                         KeyCode::Enter => {
-                            let line = input.clone();
+                            let line = input.trim().to_string();
                             input.clear();
                             if line.is_empty() { continue; }
 
                             if line.starts_with("/ip4/") {
-                                match line.parse::<libp2p::Multiaddr>() {
-                                    Ok(addr) => {
-                                        if let Err(e) = swarm.dial(addr.clone()) {
-                                            messages.push(format!("Failed to dial {}: {:?}", addr, e));
-                                        } else {
-                                            messages.push(format!("Dialing {}...", addr));
-                                        }
+                                let _ = cmd_tx.send(NetworkCommand::Dial(line)).await;
+                            } else if line.starts_with("/find ") {
+                                let peer_str = line.trim_start_matches("/find ").trim();
+                                match peer_str.parse::<PeerId>() {
+                                    Ok(peer_id) => {
+                                        let _ = cmd_tx.send(NetworkCommand::FindPeer(peer_id)).await;
                                     }
-                                    Err(e) => messages.push(format!("Invalid address format: {:?}", e)),
+                                    Err(_) => messages.push("Invalid Peer ID format.".to_string()),
                                 }
                             } else {
-                                let chat_msg = ChatMessage {
-                                    sender: username.clone(),
-                                    content: line.clone(),
-                                };
-                                let json_bytes = serde_json::to_vec(&chat_msg).expect("Failed to serialize");
-
-                                if let Err(e) = swarm.behaviour_mut().gossipsub.publish(topic.clone(), json_bytes) {
-                                    messages.push(format!("Failed to publish: {:?}", e));
-                                } else {
-                                    let now = Local::now().format("%H:%M:%S").to_string();
-                                    let display_msg = format!("[{}] {}: {}", now, username, line);
-                                    messages.push(display_msg.clone());
-                                    let _ = history_file.write_all(format!("{}\n", display_msg).as_bytes()).await;
-                                }
+                                let _ = cmd_tx.send(NetworkCommand::Publish(line)).await;
                             }
                         }
                         KeyCode::Char(c) => input.push(c),
@@ -135,49 +239,22 @@ async fn main() -> Result<(), Box<dyn Error>> {
                     }
                 }
             }
-
-            event = swarm.select_next_some() => match event {
-                SwarmEvent::NewListenAddr { address, .. } => {
-                    messages.push(format!("Node listening on: {}", address));
+            Some(event) = event_rx.recv() => match event {
+                NetworkEvent::Log(msg) => {
+                    messages.push(format!("[System] {msg}"));
                 }
-                SwarmEvent::Behaviour(ChatBehaviourEvent::Mdns(mdns::Event::Discovered(list))) => {
-                    for (peer_id, _) in list {
-                        swarm.behaviour_mut().gossipsub.add_explicit_peer(&peer_id);
-                        let short_id = format!("Unknown ({})", &peer_id.to_string()[..8]);
-                        connected_peers.insert(peer_id.to_string(), short_id);
-                    }
+                NetworkEvent::MessageReceived(sender, content) => {
+                    let now = Local::now().format("%H:%M:%S").to_string();
+                    let display_msg = format!("[{now}] {sender}: {content}");
+                    messages.push(display_msg.clone());
+                    let _ = history_file.write_all(format!("{display_msg}\n").as_bytes()).await;
                 }
-                SwarmEvent::Behaviour(ChatBehaviourEvent::Mdns(mdns::Event::Expired(list))) => {
-                    for (peer_id, _) in list {
-                        swarm.behaviour_mut().gossipsub.remove_explicit_peer(&peer_id);
-                        connected_peers.remove(&peer_id.to_string());
-                    }
+                NetworkEvent::PeerConnected(peer_id, name) => {
+                    connected_peers.insert(peer_id, name);
                 }
-                SwarmEvent::ConnectionEstablished { peer_id, .. } => {
-                    swarm.behaviour_mut().gossipsub.add_explicit_peer(&peer_id);
-                    let short_id = format!("Unknown ({})", &peer_id.to_string()[..8]);
-                    connected_peers.insert(peer_id.to_string(), short_id);
+                NetworkEvent::PeerDisconnected(peer_id) => {
+                    connected_peers.remove(&peer_id);
                 }
-                SwarmEvent::ConnectionClosed { peer_id, .. } => {
-                    swarm.behaviour_mut().gossipsub.remove_explicit_peer(&peer_id);
-                    connected_peers.remove(&peer_id.to_string());
-                }
-                SwarmEvent::Behaviour(ChatBehaviourEvent::Gossipsub(gossipsub::Event::Message {
-                    propagation_source: peer_id,
-                    message,
-                    ..
-                })) => {
-                    if let Ok(chat_msg) = serde_json::from_slice::<ChatMessage>(&message.data) {
-                        let now = Local::now().format("%H:%M:%S").to_string();
-                        let display_msg = format!("[{}] {}: {}", now, chat_msg.sender, chat_msg.content);
-                        messages.push(display_msg.clone());
-                        let _ = history_file.write_all(format!("{}\n", display_msg).as_bytes()).await;
-                        connected_peers.insert(peer_id.to_string(), chat_msg.sender);
-                    } else {
-                        messages.push(format!("Unknown Format: '{}'", String::from_utf8_lossy(&message.data)));
-                    }
-                }
-                _ => {}
             }
         }
     }
