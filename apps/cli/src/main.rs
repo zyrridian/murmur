@@ -233,44 +233,56 @@ async fn main() -> Result<(), Box<dyn Error>> {
         })?;
 
         tokio::select! {
-            Some(Ok(crossterm::event::Event::Key(key))) = crossterm_events.next() => {
-                if key.kind == KeyEventKind::Press {
-                    match key.code {
-                        KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => break,
-                        KeyCode::Enter => {
-                            let line = input.trim().to_string();
-                            input.clear();
-                            if line.is_empty() { continue; }
+            Some(Ok(event)) = crossterm_events.next() => {
+                match event {
+                    crossterm::event::Event::Key(key) => {
+                        if key.kind == KeyEventKind::Press {
+                            match key.code {
+                                KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => break,
+                                KeyCode::Enter => {
+                                    let line = input.trim().to_string();
+                                    input.clear();
+                                    if line.is_empty() { continue; }
 
-                            if line.starts_with("/ip4/") {
-                                let _ = cmd_tx.send(NetworkCommand::Dial(line)).await;
-                            } else if line.starts_with("/find ") {
-                                let peer_str = line.trim_start_matches("/find ").trim();
-                                match peer_str.parse::<PeerId>() {
-                                    Ok(peer_id) => {
-                                        let _ = cmd_tx.send(NetworkCommand::FindPeer(peer_id)).await;
+                                    if line.starts_with("/ip4/") {
+                                        let _ = cmd_tx.send(NetworkCommand::Dial(line)).await;
+                                    } else if line.starts_with("/find ") {
+                                        let peer_str = line.trim_start_matches("/find ").trim();
+                                        match peer_str.parse::<PeerId>() {
+                                            Ok(peer_id) => {
+                                                let _ = cmd_tx.send(NetworkCommand::FindPeer(peer_id)).await;
+                                            }
+                                            Err(_) => messages.push("Invalid Peer ID format.".to_string()),
+                                        }
+                                    } else {
+                                        let _ = cmd_tx.send(NetworkCommand::Publish(line.clone())).await;
+                                        let now = Local::now().format("%H:%M:%S").to_string();
+                                        let display_msg = format!("[{now}] {username}: {line}");
+                                        messages.push(display_msg);
+
+                                        let _ = sqlx::query("INSERT INTO messages (timestamp, sender, content) VALUES (?, ?, ?)")
+                                            .bind(&now)
+                                            .bind(&username)
+                                            .bind(&line)
+                                            .execute(&pool)
+                                            .await;
                                     }
-                                    Err(_) => messages.push("Invalid Peer ID format.".to_string()),
                                 }
-                            } else {
-                                let _ = cmd_tx.send(NetworkCommand::Publish(line.clone())).await;
-                                let now = Local::now().format("%H:%M:%S").to_string();
-                                let display_msg = format!("[{now}] {username}: {line}");
-                                messages.push(display_msg);
-
-                                let _ = sqlx::query("INSERT INTO messages (timestamp, sender, content) VALUES (?, ?, ?)")
-                                    .bind(&now)
-                                    .bind(&username)
-                                    .bind(&line)
-                                    .execute(&pool)
-                                    .await;
+                                KeyCode::Char(c) => input.push(c),
+                                KeyCode::Backspace => { input.pop(); }
+                                KeyCode::Esc => break,
+                                _ => {}
                             }
                         }
-                        KeyCode::Char(c) => input.push(c),
-                        KeyCode::Backspace => { input.pop(); }
-                        KeyCode::Esc => break,
-                        _ => {}
                     }
+                    // Focus events are ignored but keep the loop alive
+                    crossterm::event::Event::FocusLost => {
+                        // No action needed; raw mode stays enabled.
+                    }
+                    crossterm::event::Event::FocusGained => {
+                        // No action needed.
+                    }
+                    _ => {}
                 }
             }
             Some(event) = event_rx.recv() => match event {
@@ -279,15 +291,18 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 }
                 NetworkEvent::MessageReceived(sender, content) => {
                     let now = Local::now().format("%H:%M:%S").to_string();
-                    let display_msg = format!("[{now}] {sender}: {content}");
-                    messages.push(display_msg);
+                    // Skip echo of our own published messages to avoid duplicate lines
+                    if sender != username {
+                        let display_msg = format!("[{now}] {sender}: {content}");
+                        messages.push(display_msg);
 
-                    let _ = sqlx::query("INSERT INTO messages (timestamp, sender, content) VALUES (?, ?, ?)")
-                        .bind(&now)
-                        .bind(&sender)
-                        .bind(&content)
-                        .execute(&pool)
-                        .await;
+                        let _ = sqlx::query("INSERT INTO messages (timestamp, sender, content) VALUES (?, ?, ?)")
+                            .bind(&now)
+                            .bind(&sender)
+                            .bind(&content)
+                            .execute(&pool)
+                            .await;
+                    }
                 }
                 NetworkEvent::PeerConnected(peer_id, name) => {
                     connected_peers.insert(peer_id, name);
